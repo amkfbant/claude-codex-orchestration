@@ -1,0 +1,41 @@
+# Project-scoped Codex CLI configuration template.
+#
+# Precedence, highest to lowest:
+# 1. CLI flags and -c/--config overrides
+# 2. --profile values
+# 3. This project file: .codex/config.toml, only after the project is trusted
+# 4. User file: ~/.codex/config.toml
+# 5. System config, if present
+# 6. Codex built-in defaults
+#
+# First run `codex` once from this repository root and accept the trust prompt
+# if shown. Codex loads project-scoped .codex/config.toml only for trusted
+# projects. Do not store secrets in this file.
+#
+# This template intentionally does not hard-code concrete model names because
+# available models change over time. Fill placeholders only after checking the
+# current Codex model catalog or official model documentation.
+
+# Primary model for implementation dispatches.
+# model = "<model-name>"
+
+# Non-interactive orchestration generally invokes Codex with explicit CLI flags.
+# These values are shown as project defaults for manual Codex runs only.
+# approval_policy = "never"
+# sandbox_mode = "workspace-write"
+
+# Optional workspace-write sandbox controls.
+# [sandbox_workspace_write]
+# network_access = false
+# writable_roots = []
+
+# Optional default profile. Uncomment only if you want all Codex runs in this
+# project to start from that profile unless overridden by --profile.
+# profile = "review"
+
+# Review profile example. Use a different or stronger model for semantic review
+# if your account and current Codex release support it.
+# [profiles.review]
+# model = "<review-model-name>"
+# approval_policy = "never"
+# sandbox_mode = "read-only"

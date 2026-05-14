@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodexSemanticReviewOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings", "spec_drift", "missing_tests", "ready_to_merge"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["approve", "request_changes", "reject"]},
+    "summary": {"type": "string", "minLength": 1},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "file", "message"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+          "category": {"type": "string", "enum": ["correctness", "spec_drift", "test_coverage", "security", "style", "other"]},
+          "file": {"type": "string"},
+          "line": {"type": "integer", "minimum": 1},
+          "message": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "spec_drift": {"type": "array", "items": {"type": "string"}},
+    "missing_tests": {"type": "array", "items": {"type": "string"}},
+    "ready_to_merge": {"type": "boolean"}
+  }
+}

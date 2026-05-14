@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read(CLAUDE.md)",
+      "Read(AGENTS.md)",
+      "Read(.orchestration/**)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git worktree list *)",
+      "Bash(python3 .orchestration/scripts/orch.py *)",
+      "Bash(.orchestration/bin/*)",
+      "Bash(jq *)",
+      "Bash(codex login status)",
+      "Bash(.orchestration/bin/orchestration-init *)",
+      "Bash(.orchestration/bin/codex-review *)",
+      "Bash(.orchestration/bin/spec *)"
+    ],
+    "ask": [
+      "Bash(codex exec *)",
+      "Bash(git merge *)",
+      "Bash(git worktree add *)",
+      "Bash(git worktree remove *)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(secrets/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git filter-branch*)",
+      "Bash(git filter-repo*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(sudo *)",
+      "Bash(codex exec *--dangerously-bypass-approvals-and-sandbox*)",
+      "Bash(codex exec *--yolo*)",
+      "Bash(codex exec *danger-full-access*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .orchestration/scripts/orch.py hook-pretool"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "TZ": "UTC",
+    "LC_ALL": "C.UTF-8"
+  },
+  "maxSkillDescriptionChars": 1536,
+  "skillListingBudgetFraction": 0.02
+}

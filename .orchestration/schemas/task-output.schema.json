@@ -1,0 +1,23 @@
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodexTaskOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "changed_files", "commands_run", "risks", "ready_for_review"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code"],
+        "properties": {"command": {"type": "string"}, "exit_code": {"type": "integer"}}
+      }
+    },
+    "risks": {"type": "array", "items": {"type": "string"}},
+    "ready_for_review": {"type": "boolean"}
+  }
+}

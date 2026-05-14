@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OrchestrationTaskSpecFrontmatter",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["id", "title", "kind", "status", "owner", "version"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^T[0-9]{14}-[a-f0-9]{6}$"},
+    "title": {"type": "string", "minLength": 1},
+    "kind": {"type": "string", "enum": ["feature", "bugfix", "behavior", "api", "security", "performance", "refactor", "docs", "config", "test", "chore"]},
+    "status": {"type": "string", "enum": ["draft", "review", "approved"]},
+    "owner": {"type": "string", "enum": ["claude"]},
+    "version": {"type": "integer", "minimum": 1}
+  }
+}

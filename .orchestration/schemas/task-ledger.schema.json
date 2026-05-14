@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "commands": {
+      "additionalProperties": false,
+      "properties": {
+        "build": {
+          "type": "string"
+        },
+        "install": {
+          "type": "string"
+        },
+        "lint": {
+          "type": "string"
+        },
+        "test": {
+          "type": "string"
+        },
+        "typecheck": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "install",
+        "lint",
+        "typecheck",
+        "test",
+        "build"
+      ],
+      "type": "object"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "settings": {
+      "additionalProperties": true,
+      "properties": {
+        "failure_strategy_after": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_parallel": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "user_escalation_after": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "tasks": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "acceptance": {
+            "type": "string"
+          },
+          "artifacts": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "attempts": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "base_ref": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "codex_session_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "dependencies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hard_budget_seconds": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^T[0-9]{14}-[a-f0-9]{6}$",
+            "type": "string"
+          },
+          "last_dispatch_head": {
+            "type": "string"
+          },
+          "last_error_hash": {
+            "type": "string"
+          },
+          "last_reason": {
+            "type": "string"
+          },
+          "max_attempts": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "merged_at": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "same_failure_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shared_resources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "soft_budget_seconds": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "codex_review",
+              "spec_approved",
+              "spec_review",
+              "spec_draft",
+              "pending",
+              "assigned",
+              "running",
+              "review",
+              "merged",
+              "failed",
+              "blocked"
+            ],
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "touched_paths": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "worktree": {
+            "type": "string"
+          },
+          "spec": {
+            "type": "string"
+          },
+          "codex_review": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "slug",
+          "objective",
+          "acceptance",
+          "status",
+          "dependencies",
+          "touched_paths",
+          "attempts",
+          "max_attempts",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "updated_at": {
+      "type": "string"
+    },
+    "version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "project",
+    "created_at",
+    "updated_at",
+    "commands",
+    "settings",
+    "tasks"
+  ],
+  "title": "OrchestrationTaskLedger",
+  "type": "object"
+}
