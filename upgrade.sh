@@ -241,5 +241,9 @@ cat <<EOF
      cd $TARGET
      git add -A
      git commit -m "Upgrade ${KIT_NAME} ${CURRENT_VERSION} -> ${NEW_VERSION}"
+
+5. (Optional) Verify your project-specific skills are still present:
+     ls $TARGET/.claude/skills/proj-* 2>/dev/null
+     # See .orchestration/docs/EXTENDING.md for the extension model.
 ===================================================================
 EOF

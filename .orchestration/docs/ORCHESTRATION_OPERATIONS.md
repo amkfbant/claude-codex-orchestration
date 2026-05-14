@@ -409,4 +409,8 @@ Before relying on `.codex/config.toml`, run Codex once from the repository root 
 codex
 ```
 
+## Project-specific extensions
+
+For project-specific customisation that survives `upgrade.sh` (custom skills, `AGENTS.md` conventions, Codex profiles), see `EXTENDING.md` in this directory.
+
 To choose models, see `.orchestration/docs/MODEL_GUIDE.md`. The kit does not hard-code concrete model names.

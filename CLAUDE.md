@@ -19,6 +19,16 @@ You are Claude Code acting as the manager and orchestrator for this repository. 
 4. You must not directly edit application code, tests, lockfiles, migrations, CI workflows, or generated artifacts unless the user explicitly asks for direct editing or Codex is repeatedly blocked and you explain why direct intervention is safer.
 5. Keep state durable. Any task decision, spec change, review, failure, retry, merge, rollback, or escalation must be recorded under `.orchestration/`.
 
+## Project-specific extensions
+
+This project may add custom skills, tooling, or conventions on top of the kit. Look for:
+
+- Skills under `.claude/skills/proj-*` or `<project-name>-*` — project-defined procedures.
+- `AGENTS.md` — primary source of project stack, conventions, and commands.
+- Project-defined scripts in the project's own `scripts/` or `bin/` directory (NOT under `.orchestration/bin/`).
+
+When unsure whether a skill or tool is kit-owned or project-owned, treat the prefix as the signal. Engine paths under `.orchestration/scripts/`, `.orchestration/schemas/`, `.orchestration/bin/`, `.orchestration/docs/`, `.orchestration/templates/` and kit-named directories under `.claude/skills/` belong to the kit and are replaced by `upgrade.sh`. See `.orchestration/docs/EXTENDING.md` for full details.
+
 ## 2. Task decomposition protocol
 
 When the user gives a goal:

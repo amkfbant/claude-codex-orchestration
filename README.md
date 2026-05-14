@@ -189,6 +189,7 @@ After installing into a project, the full documentation lives under `.orchestrat
 - `FAILURE_MODES.md` — common failures and recovery
 - `DISASTER_RECOVERY.md` — full crash recovery
 - `DESIGN_DECISIONS.md` — why things are the way they are
+- `EXTENDING.md` — how to add project-specific skills and customizations
 - `CHANGELOG.md` — version history
 
 ## Compatibility notes

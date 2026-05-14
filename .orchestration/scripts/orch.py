@@ -893,13 +893,10 @@ def ensure_gitignore_block(root: pathlib.Path) -> Dict[str, Any]:
         "!.orchestration/cache/.gitkeep",
         ".orchestration/locks/**",
         "!.orchestration/locks/.gitkeep",
-        ".orchestration/tasks/*/codex.stdout.jsonl",
-        ".orchestration/tasks/*/codex.stderr.log",
-        ".orchestration/tasks/*/codex.review.stdout.jsonl",
-        ".orchestration/tasks/*/codex.review.stderr.log",
-        ".orchestration/tasks/*/validation.log",
-        ".orchestration/tasks/*/merge-validation.log",
-        ".orchestration/tasks/*/*.tmp",
+        "# Ignore all task runtime artifacts; keep only spec history",
+        ".orchestration/tasks/*/**",
+        "!.orchestration/tasks/*/spec.md",
+        "!.orchestration/tasks/*/spec.v*.md",
         ".orchestration/session-*.json",
         ".orchestration/session-*.jsonl",
         ".orchestration/session-*.txt",
@@ -907,25 +904,46 @@ def ensure_gitignore_block(root: pathlib.Path) -> Dict[str, Any]:
         ".orchestration/audit.jsonl",
         ".orchestration/manager.lock",
         ".orchestration/ledger.json.backup.*",
-        ".orchestration/tasks/*/phase*/codex.stdout.jsonl",
-        ".orchestration/tasks/*/phase*/codex.stderr.log",
-        ".orchestration/tasks/*/phase*/codex.review.stdout.jsonl",
-        ".orchestration/tasks/*/phase*/codex.review.stderr.log",
-        ".orchestration/tasks/*/phase*/validation.log",
         ".codex/config.local.toml",
         ".codex/auth.json",
         ".codex/sessions/",
         ".codex/log/",
         "*.tmp",
     ]
+    # Rules previously emitted that are now superseded by the
+    # `.orchestration/tasks/*/**` wildcard. Stripped from any existing block on
+    # merge so upgraded installs do not accumulate stale patterns.
+    deprecated_rules = {
+        ".orchestration/tasks/*/codex.stdout.jsonl",
+        ".orchestration/tasks/*/codex.stderr.log",
+        ".orchestration/tasks/*/codex.review.stdout.jsonl",
+        ".orchestration/tasks/*/codex.review.stderr.log",
+        ".orchestration/tasks/*/validation.log",
+        ".orchestration/tasks/*/merge-validation.log",
+        ".orchestration/tasks/*/*.tmp",
+        ".orchestration/tasks/*/phase*/codex.stdout.jsonl",
+        ".orchestration/tasks/*/phase*/codex.stderr.log",
+        ".orchestration/tasks/*/phase*/codex.review.stdout.jsonl",
+        ".orchestration/tasks/*/phase*/codex.review.stderr.log",
+        ".orchestration/tasks/*/phase*/validation.log",
+    }
     block = begin + "\n" + "\n".join(rules) + "\n" + end + "\n"
     old = path.read_text(encoding="utf-8") if path.exists() else ""
     if begin in old and end in old:
         pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", re.DOTALL)
         match = pattern.search(old)
         current = match.group(0) if match else ""
-        existing_rules = [ln.strip() for ln in current.splitlines() if ln.strip() and not ln.startswith("#")]
-        merged = []
+        existing_rules: List[str] = []
+        for ln in current.splitlines():
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            if stripped == begin or stripped == end:
+                continue
+            if stripped in deprecated_rules:
+                continue
+            existing_rules.append(stripped)
+        merged: List[str] = []
         for rule in existing_rules + rules:
             if rule not in merged:
                 merged.append(rule)
