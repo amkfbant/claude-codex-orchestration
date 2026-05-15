@@ -310,13 +310,20 @@ grep 'spec.bypass\|codex.semantic_review.bypassed' .orchestration/progress.jsonl
 .orchestration/bin/summarize-session --since 7d --max-events 100
 ```
 
-### Manager lock
+### Session and lock diagnostics (v3.3)
+
+`manager-lock` / `manager-unlock` are retired in v3.3 and remain only as deprecated no-ops. Per-state-file `fcntl.flock` now guards every ledger / merge-queue / LEARNED.md / progress.jsonl mutation. Use:
 
 ```bash
-.orchestration/bin/manager-status
-.orchestration/bin/manager-lock --ttl-hours 12
-.orchestration/bin/manager-unlock
+.orchestration/bin/session-list           # active sessions seen in progress.jsonl
+.orchestration/bin/lock-status            # which state locks are currently held
+.orchestration/bin/stuck-detector \
+    --dead-session-minutes 30             # flag running tasks whose session is silent
 ```
+
+`manager-status` is kept as an alias of `session list` for backward compatibility.
+
+See `PARALLEL_SESSIONS.md` for the full multi-session operational model.
 
 ### Audit log
 
@@ -367,13 +374,15 @@ Audit:
 .orchestration/bin/audit show --since 7d
 ```
 
-Manager awareness:
+Session and lock awareness (v3.3):
 
 ```bash
-.orchestration/bin/manager-status
-.orchestration/bin/manager-lock --ttl-hours 8
-.orchestration/bin/manager-unlock
+.orchestration/bin/session-list
+.orchestration/bin/lock-status
+.orchestration/bin/stuck-detector --dead-session-minutes 30
 ```
+
+`manager-status` remains as an alias of `session list`; `manager-lock` / `manager-unlock` are deprecated no-ops.
 
 Lessons:
 

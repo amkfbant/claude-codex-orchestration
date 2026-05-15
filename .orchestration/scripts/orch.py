@@ -10,14 +10,133 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+
+# Concurrency model:
+# - state_lock() is a per-state-file fcntl flock. Linux/macOS only.
+# - Lock files live under .orchestration/locks/<name>.flock; they are kit-managed
+#   and gitignored.
+# - Lock discipline:
+#     with state_lock(root, "ledger"):
+#         data = read_ledger(root)
+#         data = modify(data)
+#         write_ledger(root, data)
+#     # release lock — long ops (codex exec, subprocess, network) go here.
+# - NEVER hold a state_lock() across codex exec, install/lint/test, git push,
+#   or any operation that takes seconds. Read state, mutate, write, release.
+# - If two locks are required in one critical section (rare), acquire in this
+#   fixed order to prevent deadlock:
+#       ledger -> merge-queue -> learned -> progress
+#   In practice, hold only one lock at a time.
+
+if sys.platform == "win32":
+    # The kit is Linux/macOS only. fcntl.flock does not exist on Windows.
+    raise RuntimeError(
+        "claude-codex-orchestration requires Linux or macOS; Windows is not supported."
+    )
+
+import fcntl  # noqa: E402
+
+_LOCK_RETRY_INTERVAL = 0.05
+_LOCK_DEFAULT_TIMEOUT = 30
+# Per-process re-entrancy counter: fcntl.flock is per-open-file-description,
+# so a second open() of the same lock file inside the same process would
+# deadlock under LOCK_EX | LOCK_NB. We track held locks by name and skip
+# the kernel-level acquire when this process already holds the lock.
+_HELD_LOCKS: Dict[str, int] = {}
+
+
+@contextmanager
+def state_lock(root: pathlib.Path, name: str, timeout: float = _LOCK_DEFAULT_TIMEOUT) -> Iterator[None]:
+    """
+    Process-level fcntl.flock on .orchestration/locks/<name>.flock.
+
+    Acquire around any read-modify-write of a shared state file (ledger.json,
+    merge-queue.json, LEARNED.md, progress.jsonl). Do NOT hold across
+    long-running operations (codex exec, install/lint/test, git push, network).
+
+    Re-entrant within the same process (a nested state_lock(same name) returns
+    immediately without re-acquiring the kernel lock).
+
+    Raises TimeoutError when another process holds the lock past `timeout`.
+    """
+    if _HELD_LOCKS.get(name, 0) > 0:
+        _HELD_LOCKS[name] += 1
+        try:
+            yield
+        finally:
+            _HELD_LOCKS[name] -= 1
+        return
+
+    locks_dir = root / ".orchestration" / "locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = locks_dir / f"{name}.flock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
+    deadline = time.time() + timeout
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                _HELD_LOCKS[name] = 1
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"could not acquire state lock '{name}' within {timeout}s; "
+                        f"another orchestration process may be stuck. "
+                        f"Inspect with: .orchestration/bin/lock-status"
+                    )
+                time.sleep(_LOCK_RETRY_INTERVAL)
+        yield
+    finally:
+        if acquired:
+            _HELD_LOCKS[name] = 0
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        os.close(fd)
+
+
+# Per-process session identity. Stamped into every progress.jsonl event so
+# parallel Claude sessions can be distinguished in diagnostics.
+SESSION_INFO: Dict[str, Any] = {
+    "session": uuid.uuid4().hex[:12],
+    "pid": os.getpid(),
+    "host": socket.gethostname(),
+    "user": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
+}
+
+
+def normalize_actor(actor: Any) -> Dict[str, Any]:
+    """
+    Accept both legacy string-form actor ("claude") and new structured form.
+    Returns a uniform dict so readers can rely on the same shape regardless of
+    when the event was written.
+    """
+    if isinstance(actor, str):
+        return {"role": actor, "session": None, "pid": None, "host": None, "user": None}
+    if isinstance(actor, dict):
+        return {
+            "role": actor.get("role", "unknown"),
+            "session": actor.get("session"),
+            "pid": actor.get("pid"),
+            "host": actor.get("host"),
+            "user": actor.get("user"),
+        }
+    return {"role": "unknown", "session": None, "pid": None, "host": None, "user": None}
 
 STATUS = {
     "spec_draft",
@@ -251,16 +370,47 @@ def append_event(
 ) -> None:
     p = ensure_dirs()
     payload = data or {}
+    structured_actor = {"role": actor, **SESSION_INFO}
     line = {
         "ts": now(),
-        "actor": actor,
+        "actor": structured_actor,
         "event": event,
         "task_id": task_id,
         "data": payload,
     }
-    append_jsonl(p["progress"], line)
-    if should_audit_event(event, payload):
-        append_jsonl(p["audit"], line)
+    root = p["root"] if "root" in p else git_root()
+    # POSIX O_APPEND is atomic for single line-sized writes, but the lock
+    # gives a clean serialization point under parallel sessions and lets
+    # diagnostics know who is writing.
+    with state_lock(root, "progress"):
+        append_jsonl(p["progress"], line)
+        if should_audit_event(event, payload):
+            append_jsonl(p["audit"], line)
+
+
+def save_task_atomic(task: Dict[str, Any]) -> None:
+    """
+    Atomically replace a single task entry in ledger.json.
+
+    Re-reads the ledger under state_lock("ledger") and merges the supplied task
+    into it before writing. This preserves concurrent edits to OTHER tasks made
+    by parallel Claude sessions; only the supplied task is overwritten.
+    """
+    root = git_root()
+    with state_lock(root, "ledger"):
+        p = paths(root)
+        ledger = read_json(p["ledger"], None)
+        if not isinstance(ledger, dict):
+            ledger = init_ledger(root)
+        tasks = ledger.setdefault("tasks", [])
+        for i, existing in enumerate(tasks):
+            if existing.get("id") == task.get("id"):
+                tasks[i] = task
+                break
+        else:
+            tasks.append(task)
+        ledger["updated_at"] = now()
+        write_json(p["ledger"], ledger)
 
 
 def init_ledger(root: pathlib.Path) -> Dict[str, Any]:
@@ -280,6 +430,7 @@ def init_ledger(root: pathlib.Path) -> Dict[str, Any]:
             },
             "settings": {
                 "max_parallel": 3,
+                "max_parallel_dispatches": 5,
                 "failure_strategy_after": 2,
                 "user_escalation_after": 4,
                 "diff_review_max_lines": DIFF_REVIEW_MAX_LINES,
@@ -300,8 +451,34 @@ def load_ledger() -> Dict[str, Any]:
 
 
 def save_ledger(ledger: Dict[str, Any]) -> None:
+    """
+    Persist the ledger under state_lock("ledger").
+
+    Re-reads the on-disk ledger inside the lock and merges so concurrent edits
+    to OTHER tasks made by parallel Claude sessions are preserved. The
+    in-memory copy wins for tasks it contains; tasks present only on disk are
+    appended. Top-level fields (commands, settings) use the in-memory copy.
+
+    Callers that hold state_lock("ledger") explicitly may pass through; the
+    nested acquisition is detected by an in-process re-entrancy counter and
+    returns immediately without touching the kernel lock.
+    """
     ledger["updated_at"] = now()
-    write_json(paths()["ledger"], ledger)
+    root = git_root()
+    p = paths(root)
+    with state_lock(root, "ledger"):
+        on_disk = read_json(p["ledger"], None)
+        if not isinstance(on_disk, dict):
+            write_json(p["ledger"], ledger)
+            return
+        in_mem_ids = {t.get("id") for t in ledger.get("tasks", [])}
+        merged_tasks: List[Dict[str, Any]] = list(ledger.get("tasks", []))
+        for t in on_disk.get("tasks", []):
+            if t.get("id") not in in_mem_ids:
+                merged_tasks.append(t)
+        result = dict(ledger)
+        result["tasks"] = merged_tasks
+        write_json(p["ledger"], result)
 
 
 def slugify(text: str, max_len: int = 48) -> str:
@@ -310,9 +487,16 @@ def slugify(text: str, max_len: int = 48) -> str:
 
 
 def new_task_id(title: str) -> str:
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
-    salt = f"{title}:{time.time_ns()}"
-    return f"T{ts}-{hashlib.sha1(salt.encode()).hexdigest()[:6]}"
+    # Format: T<YYYYMMDDhhmmssffffff>-<pid4>-<rand4>
+    # Microsecond timestamp + PID + random eliminates collisions when multiple
+    # Claude sessions create tasks in the same second from different processes.
+    # Legacy v1 IDs (T<14digits>-<6hex>) remain valid; reads accept either form
+    # because task IDs are opaque strings throughout the codebase.
+    now_us = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    pid4 = f"{os.getpid() % 10000:04d}"
+    rand4 = secrets.token_hex(2)
+    _ = title  # title is no longer needed for uniqueness; kept for API compat
+    return f"T{now_us}-{pid4}-{rand4}"
 
 
 def find_task(ledger: Dict[str, Any], task_id: str) -> Dict[str, Any]:
@@ -415,12 +599,13 @@ class AtomicLock:
 def cmd_init(args: argparse.Namespace) -> int:
     root = git_root()
     p = ensure_dirs(root)
-    ledger = init_ledger(root)
-    for k in ["install", "lint", "typecheck", "test", "build"]:
-        val = getattr(args, k, None)
-        if val is not None:
-            ledger.setdefault("commands", {})[k] = val
-    save_ledger(ledger)
+    with state_lock(root, "ledger"):
+        ledger = init_ledger(root)
+        for k in ["install", "lint", "typecheck", "test", "build"]:
+            val = getattr(args, k, None)
+            if val is not None:
+                ledger.setdefault("commands", {})[k] = val
+        save_ledger(ledger)
     run(["git", "config", "rerere.enabled", "true"], cwd=root)
     run(["git", "config", "rerere.autoupdate", "true"], cwd=root)
     for sub in ["npm", "pnpm", "pip", "cargo", "go", "tmp", "installed"]:
@@ -432,51 +617,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_ledger(args: argparse.Namespace) -> int:
-    ledger = load_ledger()
-
-    if args.ledger_cmd == "new":
-        touched_paths = normalize_list(args.paths)
-        if not touched_paths and not args.allow_empty_paths:
-            raise ValueError(
-                "--paths is required. Empty touched_paths has unknown blast radius and disables parallel scheduling. "
-                "Use --allow-empty-paths only for intentionally serialized exploratory tasks."
-            )
-        task = {
-            "id": args.id or new_task_id(args.title),
-            "title": args.title,
-            "slug": slugify(args.title),
-            "objective": args.objective,
-            "acceptance": args.acceptance or "",
-            "status": "pending",
-            "dependencies": normalize_list(args.deps),
-            "touched_paths": touched_paths,
-            "shared_resources": [],
-            "attempts": 0,
-            "max_attempts": args.max_attempts,
-            "timeout_seconds": args.timeout,
-            "soft_budget_seconds": args.soft_budget,
-            "hard_budget_seconds": args.hard_budget,
-            "created_at": now(),
-            "updated_at": now(),
-            "owner": "claude",
-            "branch": "",
-            "worktree": "",
-            "base_ref": "",
-            "last_dispatch_head": "",
-            "last_error_hash": "",
-            "same_failure_count": 0,
-            "artifacts": {},
-            "spec_history": [],
-            "phase_state": "",
-        }
-        task["shared_resources"] = [p for p in task["touched_paths"] if is_shared_path(p)]
-        ledger.setdefault("tasks", []).append(task)
-        save_ledger(ledger)
-        append_event("claude", "task.created", task["id"], {"title": args.title})
-        print(json.dumps(task, ensure_ascii=False, indent=2))
-        return 0
+    root = git_root()
 
     if args.ledger_cmd == "list":
+        ledger = load_ledger()
         if args.json:
             print(json.dumps(ledger.get("tasks", []), ensure_ascii=False, indent=2))
         else:
@@ -485,19 +629,66 @@ def cmd_ledger(args: argparse.Namespace) -> int:
         return 0
 
     if args.ledger_cmd == "show":
+        ledger = load_ledger()
         print(json.dumps(find_task(ledger, args.id), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.ledger_cmd == "new":
+        touched_paths = normalize_list(args.paths)
+        if not touched_paths and not args.allow_empty_paths:
+            raise ValueError(
+                "--paths is required. Empty touched_paths has unknown blast radius and disables parallel scheduling. "
+                "Use --allow-empty-paths only for intentionally serialized exploratory tasks."
+            )
+        with state_lock(root, "ledger"):
+            ledger = load_ledger()
+            task = {
+                "id": args.id or new_task_id(args.title),
+                "title": args.title,
+                "slug": slugify(args.title),
+                "objective": args.objective,
+                "acceptance": args.acceptance or "",
+                "status": "pending",
+                "dependencies": normalize_list(args.deps),
+                "touched_paths": touched_paths,
+                "shared_resources": [],
+                "attempts": 0,
+                "max_attempts": args.max_attempts,
+                "timeout_seconds": args.timeout,
+                "soft_budget_seconds": args.soft_budget,
+                "hard_budget_seconds": args.hard_budget,
+                "created_at": now(),
+                "updated_at": now(),
+                "owner": "claude",
+                "branch": "",
+                "worktree": "",
+                "base_ref": "",
+                "last_dispatch_head": "",
+                "last_error_hash": "",
+                "same_failure_count": 0,
+                "artifacts": {},
+                "spec_history": [],
+                "phase_state": "",
+            }
+            task["shared_resources"] = [p for p in task["touched_paths"] if is_shared_path(p)]
+            ledger.setdefault("tasks", []).append(task)
+            save_ledger(ledger)
+        append_event("claude", "task.created", task["id"], {"title": args.title})
+        print(json.dumps(task, ensure_ascii=False, indent=2))
         return 0
 
     if args.ledger_cmd == "set-status":
         if args.status not in STATUS:
             raise ValueError(f"invalid status: {args.status}")
-        task = find_task(ledger, args.id)
-        old = task["status"]
-        task["status"] = args.status
-        task["updated_at"] = now()
-        if args.reason:
-            task["last_reason"] = args.reason
-        save_ledger(ledger)
+        with state_lock(root, "ledger"):
+            ledger = load_ledger()
+            task = find_task(ledger, args.id)
+            old = task["status"]
+            task["status"] = args.status
+            task["updated_at"] = now()
+            if args.reason:
+                task["last_reason"] = args.reason
+            save_ledger(ledger)
         append_event(
             "claude",
             "task.status",
@@ -508,11 +699,13 @@ def cmd_ledger(args: argparse.Namespace) -> int:
         return 0
 
     if args.ledger_cmd == "set-commands":
-        for k in ["install", "lint", "typecheck", "test", "build"]:
-            val = getattr(args, k, None)
-            if val is not None:
-                ledger.setdefault("commands", {})[k] = val
-        save_ledger(ledger)
+        with state_lock(root, "ledger"):
+            ledger = load_ledger()
+            for k in ["install", "lint", "typecheck", "test", "build"]:
+                val = getattr(args, k, None)
+                if val is not None:
+                    ledger.setdefault("commands", {})[k] = val
+            save_ledger(ledger)
         print(json.dumps(ledger.get("commands", {}), ensure_ascii=False, indent=2))
         return 0
 
@@ -1778,20 +1971,24 @@ def run_validation(
     ledger: Dict[str, Any],
     log_path: pathlib.Path,
     timeout_per_cmd: int = 1200,
+    skip_install: bool = False,
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     commands = ledger.get("commands", {})
     results: List[Dict[str, Any]] = []
     env = validation_env(root)
 
     with log_path.open("a", encoding="utf-8") as log:
-        install_result = run_install_if_needed(
-            root,
-            worktree,
-            commands.get("install", ""),
-            log,
-            timeout_per_cmd,
-            env,
-        )
+        if skip_install:
+            install_result = {"name": "install", "command": commands.get("install", ""), "exit_code": 0, "skipped": True, "reason": "skip_install flag"}
+        else:
+            install_result = run_install_if_needed(
+                root,
+                worktree,
+                commands.get("install", ""),
+                log,
+                timeout_per_cmd,
+                env,
+            )
         results.append(install_result)
         if install_result["exit_code"] != 0:
             return False, results
@@ -2052,8 +2249,9 @@ def run_codex_review_impl(
 
 
 def add_merge_queue(item: Dict[str, Any]) -> None:
-    p = ensure_dirs()
-    with AtomicLock("merge-queue", timeout=120):
+    root = git_root()
+    p = ensure_dirs(root)
+    with state_lock(root, "merge-queue"):
         queue = read_json(p["queue"], [])
         if not any(q.get("task_id") == item.get("task_id") for q in queue):
             queue.append(item)
@@ -2367,10 +2565,53 @@ def build_parallel_worker_contract(task: Dict[str, Any], selected_tasks: List[Di
         "</parallel_worker_contract>",
     ])
 
+def check_parallel_dispatch_capacity(ledger: Dict[str, Any], task_id: str) -> None:
+    """
+    Refuse dispatch when too many tasks are already running globally.
+
+    The cap lives in ledger.settings.max_parallel_dispatches (default 5).
+    Tasks already in the running state (including the one being re-dispatched
+    after a failure) count toward the cap; the current task is excluded so a
+    retry does not block itself.
+    """
+    settings = ledger.get("settings", {}) or {}
+    cap = int(settings.get("max_parallel_dispatches", 5))
+    running = [
+        t for t in ledger.get("tasks", [])
+        if t.get("status") == "running" and t.get("id") != task_id
+    ]
+    if len(running) >= cap:
+        ids = [t.get("id") for t in running]
+        raise RuntimeError(
+            f"max_parallel_dispatches ({cap}) reached. "
+            f"Currently running: {ids}. "
+            f"Wait for one to finish, or raise the limit in ledger settings.max_parallel_dispatches."
+        )
+
+
 def cmd_dispatch_single(args: argparse.Namespace) -> int:
     root = git_root()
     ledger = load_ledger()
+
+    if getattr(args, "warm_install_only", False):
+        commands = ledger.get("commands", {}) or {}
+        install_cmd = (commands.get("install") or "").strip()
+        if not install_cmd:
+            print(json.dumps({"warm_install": "skipped", "reason": "no install command configured"}, indent=2))
+            return 0
+        wt = root  # warm in the main worktree so workers can short-circuit via the install stamp
+        env = validation_env(root)
+        log_path = ensure_dirs(root)["cache"] / "warm-install.log"
+        with log_path.open("a", encoding="utf-8") as log:
+            result = run_install_if_needed(root, wt, install_cmd, log, timeout_per_cmd=1200, env=env)
+        print(json.dumps({"warm_install": result}, ensure_ascii=False, indent=2))
+        return 0 if result.get("exit_code", 1) == 0 else result.get("exit_code", 1)
+
+    if not args.task_id:
+        raise RuntimeError("task_id is required unless --warm-install-only is used.")
+
     task = find_task(ledger, args.task_id)
+
     fm_mode = ""
     if spec_path(args.task_id).exists():
         try:
@@ -2383,6 +2624,8 @@ def cmd_dispatch_single(args: argparse.Namespace) -> int:
 
     if task.get("status") not in {"spec_approved", "pending", "assigned", "failed", "blocked"}:
         raise RuntimeError(f"task {args.task_id} is not dispatchable: {task.get('status')}")
+
+    check_parallel_dispatch_capacity(ledger, args.task_id)
 
     spec_file = spec_path(args.task_id)
     spec_text = ""
@@ -2403,13 +2646,14 @@ def cmd_dispatch_single(args: argparse.Namespace) -> int:
         task["status"] = "running"
         task["attempts"] = int(task.get("attempts", 0)) + 1
         task["updated_at"] = now()
+        task["dispatch_session"] = SESSION_INFO["session"]
         save_ledger(ledger)
 
         append_event(
             "claude",
             "codex.dispatch.start",
             args.task_id,
-            {"worktree": str(wt), "branch": task["branch"], "pre_head": pre_head},
+            {"worktree": str(wt), "branch": task["branch"], "pre_head": pre_head, "dispatch_session": SESSION_INFO["session"]},
         )
 
         td = task_dir(args.task_id)
@@ -2496,6 +2740,16 @@ def cmd_dispatch_single(args: argparse.Namespace) -> int:
         stats = parse_jsonl(stdout_jsonl)
         task["codex_session_id"] = stats.get("thread_id", "")
 
+        rate_limit_hit = False
+        try:
+            stderr_blob = stderr_log.read_text(encoding="utf-8", errors="replace").lower()
+            rate_limit_hit = any(
+                pat in stderr_blob
+                for pat in ("rate_limit", "rate limit", "http 429", "429 too many", "rate_limit_exceeded")
+            )
+        except Exception:
+            rate_limit_hit = False
+
         write_json(
             td / "exit.json",
             {
@@ -2506,8 +2760,12 @@ def cmd_dispatch_single(args: argparse.Namespace) -> int:
                 "command": cmd,
                 "pre_head": pre_head,
                 "effective_model": effective_model_for_run(root, args.model, args.profile),
+                "rate_limit_hit": rate_limit_hit,
+                "dispatch_session": SESSION_INFO["session"],
             },
         )
+        if rate_limit_hit:
+            append_event("codex", "codex.dispatch.rate_limit", args.task_id, {"stderr_log": str(stderr_log)})
 
         if rc != 0 or timed_out or stats.get("turn_failed"):
             task["status"] = "failed"
@@ -2563,7 +2821,14 @@ def cmd_dispatch_single(args: argparse.Namespace) -> int:
         files = changed_files(wt, base_ref=pre_head)
 
         if args.validate:
-            ok, results = run_validation(root, wt, ledger, td / "validation.log", args.validation_timeout)
+            ok, results = run_validation(
+                root,
+                wt,
+                ledger,
+                td / "validation.log",
+                args.validation_timeout,
+                skip_install=getattr(args, "skip_install", False),
+            )
             write_json(td / "validation.json", {"ok": ok, "results": results})
             if not ok:
                 task["status"] = "failed"
@@ -2830,6 +3095,51 @@ def error_fingerprint(task: Dict[str, Any]) -> str:
     return hashlib.sha256("\n".join(chunks).encode("utf-8")).hexdigest()
 
 
+def detect_dead_dispatch_sessions(ledger: Dict[str, Any], dead_after_minutes: int) -> List[Dict[str, Any]]:
+    """
+    Return running tasks whose owning Claude session has been silent for
+    longer than `dead_after_minutes`. This indicates a crashed session that
+    needs manual recovery (typically `task-ledger set-status <id> failed`).
+    """
+    sessions: Dict[str, str] = {}
+    root = git_root()
+    p = ensure_dirs(root)
+    if p["progress"].exists():
+        with p["progress"].open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                actor = normalize_actor(rec.get("actor"))
+                sid = actor.get("session")
+                ts = rec.get("ts")
+                if sid and ts:
+                    sessions[sid] = ts
+    now_dt = dt.datetime.now(dt.timezone.utc).astimezone()
+    dead: List[Dict[str, Any]] = []
+    for task in ledger.get("tasks", []):
+        if task.get("status") != "running":
+            continue
+        owner = task.get("dispatch_session")
+        if not owner:
+            continue
+        last_seen = sessions.get(owner)
+        if not last_seen:
+            continue
+        parsed = parse_time(last_seen)
+        if not parsed:
+            continue
+        ago_minutes = (now_dt - parsed).total_seconds() / 60.0
+        if ago_minutes > dead_after_minutes:
+            dead.append({
+                "task_id": task["id"],
+                "owner_session": owner,
+                "last_seen_minutes_ago": round(ago_minutes, 1),
+            })
+    return dead
+
+
 def cmd_stuck_check(args: argparse.Namespace) -> int:
     ledger = load_ledger()
     changed = False
@@ -2858,6 +3168,11 @@ def cmd_stuck_check(args: argparse.Namespace) -> int:
 
         task["updated_at"] = now()
         changed = True
+
+    dead_sessions = detect_dead_dispatch_sessions(ledger, args.dead_session_minutes)
+    for entry in dead_sessions:
+        entry["action"] = "dead-session-orphan"
+        alerts.append(entry)
 
     if changed:
         save_ledger(ledger)
@@ -2990,6 +3305,7 @@ def collect_stats(since: str = "") -> Dict[str, Any]:
         retries.append(max(0, int(task.get("attempts", 0) or 0) - 1))
     review_dist: Dict[str, int] = {"approve": 0, "request_changes": 0, "reject": 0, "invalid": 0, "skipped": 0}
     total_codex_seconds = 0.0
+    rate_limit_hits = 0
     for task in tasks:
         td = task_dir(task.get("id", ""))
         for candidate in [td / "review-exit.json", td / "phase1" / "review-exit.json", td / "phase2" / "review-exit.json"]:
@@ -2998,6 +3314,8 @@ def collect_stats(since: str = "") -> Dict[str, Any]:
         for candidate in [td / "exit.json", td / "phase1" / "exit.json", td / "phase2" / "exit.json"]:
             data = read_json(candidate, {})
             total_codex_seconds += float(data.get("elapsed_seconds", 0) or 0)
+            if data.get("rate_limit_hit"):
+                rate_limit_hits += 1
         for candidate in [td / "codex.review.validation.json", td / "phase1" / "codex.review.validation.json", td / "phase2" / "codex.review.validation.json"]:
             data = read_json(candidate, {})
             verdict = ((data.get("data") or {}) if isinstance(data, dict) else {}).get("verdict")
@@ -3033,6 +3351,7 @@ def collect_stats(since: str = "") -> Dict[str, Any]:
         "semantic_review_verdicts": review_dist,
         "bypass_counts": bypass,
         "codex_elapsed_seconds_total": total_codex_seconds,
+        "rate_limit_hits": rate_limit_hits,
         "active_worktree_count": active_worktrees,
         "merge_queue_length": len(queue),
         "recent_timeline": timeline_events[-20:],
@@ -3060,7 +3379,12 @@ def stats_text(stats: Dict[str, Any]) -> str:
     lines.extend(["\n## Bypasses"])
     for k, v in stats["bypass_counts"].items():
         lines.append(f"- {k}: {v}")
-    lines.extend(["\n## Current", f"- active_worktree_count: {stats['active_worktree_count']}", f"- merge_queue_length: {stats['merge_queue_length']}"])
+    lines.extend([
+        "\n## Current",
+        f"- active_worktree_count: {stats['active_worktree_count']}",
+        f"- merge_queue_length: {stats['merge_queue_length']}",
+        f"- rate_limit_hits: {stats.get('rate_limit_hits', 0)}",
+    ])
     lines.append("\n## Recent timeline")
     for ev in stats["recent_timeline"][-10:]:
         lines.append(f"- {ev.get('ts')} {ev.get('event')} {ev.get('task_id') or ''}")
@@ -3195,40 +3519,145 @@ def cmd_summarize_session(args: argparse.Namespace) -> int:
 
 
 def manager_lock_state() -> Dict[str, Any]:
+    # Retained for backward compatibility; manager.lock has been retired in
+    # favor of per-state-file flock locks. The file path is reported for users
+    # migrating from older installs but its contents are no longer authoritative.
     lock = ensure_dirs()["manager_lock"]
     data = read_json(lock, {})
     if not data:
-        return {"locked": False, "path": str(lock)}
+        return {"locked": False, "path": str(lock), "deprecated": True}
     expires = parse_time(data.get("expires_at", ""))
     stale = bool(expires and expires < dt.datetime.now(dt.timezone.utc).astimezone())
-    return {"locked": not stale, "stale": stale, "path": str(lock), "data": data}
+    return {"locked": not stale, "stale": stale, "path": str(lock), "data": data, "deprecated": True}
 
 
-def cmd_manager_status(args: argparse.Namespace) -> int:
-    print(json.dumps(manager_lock_state(), ensure_ascii=False, indent=2))
+def collect_sessions() -> List[Dict[str, Any]]:
+    """Scan progress.jsonl and return one entry per session_id seen."""
+    root = git_root()
+    p = ensure_dirs(root)
+    sessions: Dict[str, Dict[str, Any]] = {}
+    if not p["progress"].exists():
+        return []
+    with p["progress"].open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            actor = normalize_actor(rec.get("actor"))
+            sid = actor.get("session")
+            if not sid:
+                continue
+            entry = sessions.get(sid)
+            if entry is None:
+                entry = {
+                    "session": sid,
+                    "role": actor.get("role"),
+                    "pid": actor.get("pid"),
+                    "host": actor.get("host"),
+                    "user": actor.get("user"),
+                    "first_seen": rec.get("ts"),
+                    "last_seen": rec.get("ts"),
+                    "event_count": 0,
+                }
+                sessions[sid] = entry
+            entry["last_seen"] = rec.get("ts") or entry["last_seen"]
+            entry["event_count"] += 1
+    return sorted(sessions.values(), key=lambda s: s.get("last_seen") or "", reverse=True)
+
+
+def cmd_session(args: argparse.Namespace) -> int:
+    if args.session_cmd != "list":
+        raise ValueError(args.session_cmd)
+    rows = collect_sessions()
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no sessions recorded)")
+        return 0
+    header = f"{'session':<14} {'role':<10} {'pid':>6} {'host':<20} {'last_seen':<25} {'events':>8}"
+    print(header)
+    for r in rows[:50]:
+        pid = r.get("pid") or 0
+        host = (r.get("host") or "")[:20]
+        last = (r.get("last_seen") or "")[:25]
+        print(f"{r['session']:<14} {(r.get('role') or ''):<10} {pid:>6} {host:<20} {last:<25} {r['event_count']:>8}")
     return 0
 
 
+def cmd_lock_status(args: argparse.Namespace) -> int:
+    """Report current state-lock holdings (best-effort, monitoring only)."""
+    root = git_root()
+    locks_dir = root / ".orchestration" / "locks"
+    rows: List[Dict[str, Any]] = []
+    if locks_dir.exists():
+        for lock_file in sorted(locks_dir.glob("*.flock")):
+            name = lock_file.stem
+            status = "free"
+            try:
+                fd = os.open(str(lock_file), os.O_WRONLY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    status = "HELD"
+                finally:
+                    os.close(fd)
+            except FileNotFoundError:
+                status = "missing"
+            rows.append({"name": name, "status": status, "path": str(lock_file)})
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no state locks present)")
+        return 0
+    for r in rows:
+        print(f"  {r['name']:<15} {r['status']}")
+    print("")
+    print("Note: 'HELD' means another process (or this one) holds the lock.")
+    print("For process attribution, use `lsof` / `fuser` on the .flock path.")
+    return 0
+
+
+def cmd_manager_status(args: argparse.Namespace) -> int:
+    # v3.3: alias of `session list` for backward compatibility. The legacy
+    # manager.lock state is also reported on stderr when present so migrating
+    # users can see why their old workflows behave differently.
+    legacy = manager_lock_state()
+    if legacy.get("locked"):
+        print(
+            "note: legacy manager.lock is still present at " + legacy["path"]
+            + "; manager-lock has been retired in v3.3 (advisory only).",
+            file=sys.stderr,
+        )
+    sub = argparse.Namespace(session_cmd="list", format=getattr(args, "format", "text"))
+    return cmd_session(sub)
+
+
 def cmd_manager_lock(args: argparse.Namespace) -> int:
-    p = ensure_dirs(); state = manager_lock_state()
-    if state.get("locked") and not args.force:
-        print(json.dumps(state, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 2
-    started = dt.datetime.now(dt.timezone.utc).astimezone()
-    expires = started + dt.timedelta(hours=args.ttl_hours)
-    data = {"pid": os.getpid(), "host": socket.gethostname(), "started_at": started.isoformat(timespec="seconds"), "expires_at": expires.isoformat(timespec="seconds"), "claude_session_id": os.environ.get("CLAUDE_SESSION_ID", "")}
-    write_json(p["manager_lock"], data)
-    append_event("claude", "manager.lock", data=data)
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    # v3.3: deprecated no-op kept so existing scripts don't break.
+    print(
+        "manager-lock has been retired in v3.3. Per-state-file flock locks are now"
+        " used automatically. This command is a no-op; see `session list` and `lock-status`.",
+        file=sys.stderr,
+    )
     return 0
 
 
 def cmd_manager_unlock(args: argparse.Namespace) -> int:
+    # v3.3: deprecated; clean up the legacy file if present so old installs
+    # don't carry stale state forever.
     lock = ensure_dirs()["manager_lock"]
     if lock.exists():
         lock.unlink()
-    append_event("claude", "manager.unlock", data={})
-    print("unlocked")
+    print(
+        "manager-unlock has been retired in v3.3 (no-op). Stale manager.lock removed if present.",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -3247,10 +3676,10 @@ def next_lesson_id(text: str) -> str:
 
 
 def cmd_lesson(args: argparse.Namespace) -> int:
-    p = ensure_dirs(); path = p["learned"]
+    root = git_root()
+    p = ensure_dirs(root); path = p["learned"]
     if not path.exists():
         path.write_text("# Learned lessons\n\n", encoding="utf-8")
-    text = path.read_text(encoding="utf-8")
     if args.lesson_cmd == "add":
         context, trap, lesson = args.context, args.trap, args.lesson
         if args.interactive:
@@ -3259,14 +3688,17 @@ def cmd_lesson(args: argparse.Namespace) -> int:
             lesson = lesson or input("Lesson: ")
         if not (context and trap and lesson):
             raise RuntimeError("context, trap, and lesson are required")
-        lid = next_lesson_id(text)
         kind = task_spec_meta(args.task).get("kind", "unknown") if args.task else "unknown"
-        block = f"## {lid} — {now().split('T')[0]} — from {args.task or 'manual'} (kind: {kind})\n\nContext: {context}\n\nTrap: {trap}\n\nLesson: {lesson}\n\n"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(block)
+        with state_lock(root, "learned"):
+            text = path.read_text(encoding="utf-8")
+            lid = next_lesson_id(text)
+            block = f"## {lid} — {now().split('T')[0]} — from {args.task or 'manual'} (kind: {kind})\n\nContext: {context}\n\nTrap: {trap}\n\nLesson: {lesson}\n\n"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(block)
         append_event("claude", "lesson.added", args.task or None, {"lesson_id": lid})
         print(lid)
         return 0
+    text = path.read_text(encoding="utf-8")
     if args.lesson_cmd == "list":
         cutoff = parse_since(args.since) if args.since else None
         for m in re.finditer(r"^## (L-\d{3}) — ([^—]+) — (.*)$", text, flags=re.MULTILINE):
@@ -3452,6 +3884,8 @@ def cmd_dispatch_test_first(args: argparse.Namespace) -> int:
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
+    if getattr(args, "warm_install_only", False) or not args.task_id:
+        return cmd_dispatch_single(args)
     ledger = load_ledger()
     _task = find_task(ledger, args.task_id)
     fm, _body, _sp = read_spec(args.task_id)
@@ -3573,7 +4007,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_select_parallel)
 
     s = sub.add_parser("dispatch")
-    s.add_argument("task_id")
+    s.add_argument("task_id", nargs="?", default="", help="Task ID. Omit when using --warm-install-only.")
     s.add_argument("--mode", choices=["single", "test-first"], default="")
     s.add_argument("--pause", action="store_true", help="in test-first mode, stop after phase1")
     s.add_argument("--prompt-file")
@@ -3598,6 +4032,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--review-model", default="")
     s.add_argument("--review-timeout", type=int, default=3600)
     s.add_argument("--review-patch-max-bytes", type=int, default=PATCH_REVIEW_MAX_BYTES)
+    s.add_argument(
+        "--skip-install",
+        action="store_true",
+        help="Skip install step during validation (assume parent already pre-warmed the cache).",
+    )
+    s.add_argument(
+        "--warm-install-only",
+        action="store_true",
+        help="Run install in the main worktree to pre-warm the cache, then exit. No Codex dispatch.",
+    )
     s.set_defaults(func=cmd_dispatch)
 
     s = sub.add_parser("parallel")
@@ -3644,6 +4088,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stuck-check")
     s.add_argument("--strategy-after", type=int, default=2)
     s.add_argument("--escalate-after", type=int, default=4)
+    s.add_argument(
+        "--dead-session-minutes",
+        type=int,
+        default=30,
+        help="Flag running tasks whose owning session has emitted no events for this many minutes.",
+    )
     s.set_defaults(func=cmd_stuck_check)
 
     s = sub.add_parser("resume-check")
@@ -3675,16 +4125,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-events", type=int, default=80)
     s.set_defaults(func=cmd_summarize_session)
 
-    s = sub.add_parser("manager-lock")
+    s = sub.add_parser("manager-lock", help="DEPRECATED in v3.3 (no-op).")
     s.add_argument("--ttl-hours", type=float, default=12.0)
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_manager_lock)
 
-    s = sub.add_parser("manager-unlock")
+    s = sub.add_parser("manager-unlock", help="DEPRECATED in v3.3 (no-op).")
     s.set_defaults(func=cmd_manager_unlock)
 
-    s = sub.add_parser("manager-status")
+    s = sub.add_parser("manager-status", help="Alias of `session list` (v3.3).")
+    s.add_argument("--format", choices=["text", "json"], default="text")
     s.set_defaults(func=cmd_manager_status)
+
+    s = sub.add_parser("session")
+    session_sub = s.add_subparsers(dest="session_cmd", required=True)
+    sl = session_sub.add_parser("list")
+    sl.add_argument("--format", choices=["text", "json"], default="text")
+    s.set_defaults(func=cmd_session)
+
+    s = sub.add_parser("lock-status")
+    s.add_argument("--format", choices=["text", "json"], default="text")
+    s.set_defaults(func=cmd_lock_status)
 
     s = sub.add_parser("audit")
     audit_sub = s.add_subparsers(dest="audit_cmd", required=True)

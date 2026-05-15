@@ -141,3 +141,7 @@ If you find yourself wanting to modify any of these, prefer one of these instead
 | Custom tooling scripts | Your project's `scripts/` or `bin/` | Yes (outside kit namespace) |
 | Custom Claude Code hooks | Project script, referenced from `.claude/settings.json` | Yes |
 | Engine modifications | DON'T — propose upstream instead | No (will be overwritten) |
+
+## Multi-session safety
+
+This kit is safe to run from multiple Claude sessions on the same project on the same machine. See `PARALLEL_SESSIONS.md` for workflow patterns and diagnostic tools.

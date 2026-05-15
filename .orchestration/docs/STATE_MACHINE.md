@@ -34,3 +34,9 @@ stateDiagram-v2
 ```
 
 The legacy route is preserved. Test-first states are optional and only used when dispatch mode is `test-first`.
+
+## Concurrency model
+
+Status transitions are protected by `state_lock(root, "ledger")` in `orch.py`. Two parallel Claude sessions cannot race on the ledger because the read-modify-write is atomic at the process level via `fcntl.flock`. Each task additionally carries a `dispatch_session` field that records which Claude session most recently dispatched it, used by `stuck-check --dead-session-minutes` to detect orphaned tasks after a session crash.
+
+See `PARALLEL_SESSIONS.md` for end-to-end concurrency details, diagnostics, and operational patterns.

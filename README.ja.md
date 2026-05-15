@@ -190,6 +190,7 @@ git diff -- .orchestration .claude/skills
 - `DISASTER_RECOVERY.md` — 完全クラッシュからの復旧
 - `DESIGN_DECISIONS.md` — 設計判断の経緯
 - `EXTENDING.md` — プロジェクト固有のスキル・拡張ポイントの追加方法
+- `PARALLEL_SESSIONS.md` — 複数セッション / 並列 dispatch の同時実行モデル
 - `CHANGELOG.md` — バージョン履歴
 
 ## 互換性に関する注意

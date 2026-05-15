@@ -190,6 +190,7 @@ After installing into a project, the full documentation lives under `.orchestrat
 - `DISASTER_RECOVERY.md` — full crash recovery
 - `DESIGN_DECISIONS.md` — why things are the way they are
 - `EXTENDING.md` — how to add project-specific skills and customizations
+- `PARALLEL_SESSIONS.md` — multi-session and parallel-dispatch concurrency model
 - `CHANGELOG.md` — version history
 
 ## Compatibility notes
